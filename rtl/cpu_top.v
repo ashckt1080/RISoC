@@ -142,17 +142,49 @@ module cpu_top(
     wire MEM_mem_write;
     wire MEM_mem_read;
     wire [1:0] MEM_wb_src;
-    wire [31:0] MEM_data_mem_out;
+
     wire MEM_valid;
 
-    wire MEM_mem_access;
-    wire MEM_mem_request;
-    reg MEM_request_started;
+    //LSU signals
+    wire lsu_request;
+    wire lsu_write;
+    wire [31:0] lsu_address;
+    wire [31:0] lsu_write_data;
+    wire [3:0] lsu_byte_sel;
+    wire [31:0] lsu_load_result;
+    wire lsu_misaligned;
 
-    assign MEM_mem_access = MEM_valid && (MEM_mem_read || MEM_mem_write);
-    assign MEM_mem_request = MEM_mem_access && !MEM_request_started;
-    assign MEM_wait = MEM_mem_access && !MEM_request_started;
-    //assign MEM_wait = MEM_mem_access && !(ack || err);
+    //Bus master signals
+    wire master_request;
+    wire master_write;
+    wire [31:0] master_address;
+    wire [31:0] master_write_data;
+    wire [3:0] master_byte_sel;
+    wire master_ack;
+    wire master_err;
+    wire [31:0] master_read_data;
+    wire [31:0] bus_load_data;
+    wire bus_fault;
+
+    //RAM route signals
+    wire ram_request;
+    wire ram_write;
+    wire [31:0] ram_address;
+    wire [31:0] ram_write_data;
+    wire [3:0] ram_byte_sel;
+    wire ram_ack;
+    wire ram_err;
+    wire [31:0] ram_read_data;
+
+    //UART route signals
+    wire uart_request;
+    wire uart_write;
+    wire [31:0] uart_address;
+    wire [31:0] uart_write_data;
+    wire [3:0] uart_byte_sel;
+    wire uart_ack;
+    wire uart_err;
+    wire [31:0] uart_read_data;
 
     //WB signals
     wire [31:0] WB_data;
@@ -182,9 +214,7 @@ module cpu_top(
     assign EX_jump_target_aligned = (EX_jump_target[1:0] == 2'b00);
     assign EX_jump_redirect = EX_valid && !MEM_wait && EX_jump_taken && EX_jump_target_aligned;
 
-    assign EX_instr_addr_fault = EX_valid && !MEM_wait &&
-                                 ((EX_branch_taken && !EX_branch_target_aligned) ||
-                                  (EX_jump_taken && !EX_jump_target_aligned));
+    assign EX_instr_addr_fault = EX_valid && !MEM_wait &&((EX_branch_taken && !EX_branch_target_aligned) ||(EX_jump_taken && !EX_jump_target_aligned));
 
     assign IF_pc_plus4 = IF_pc + 32'd4;
 
@@ -212,20 +242,6 @@ module cpu_top(
 
         else if(EX_m_start) begin
             EX_m_started <= 1'b1;
-        end
-    end
-
-    always @(posedge clk) begin
-        if(rst) begin
-            MEM_request_started <= 1'b0;
-        end
-
-        else if(MEM_request_started) begin
-            MEM_request_started <= 1'b0;
-        end
-
-        else if(MEM_mem_request) begin
-            MEM_request_started <= 1'b1;
         end
     end
 
@@ -415,21 +431,12 @@ module cpu_top(
                                       .mem_write_out(MEM_mem_write),
                                       .wb_src_out(MEM_wb_src));
 
-    data_mem data_mem_ (.clk(clk),
-                        .mem_read(MEM_mem_read),
-                        .mem_write(MEM_mem_write),
-                        .alu_addr_in(MEM_alu_out),
-                        .data_in(MEM_rs2_data),
-                        .funct3(MEM_funct3),
-                        .data_out(MEM_data_mem_out),
-                        .valid(MEM_mem_request));
-
     mem_wb_register mem_wb_register_ (.clk(clk),
                                       .rst(rst),
                                       .mem_wb_enable(MEM_WB_enable),
-                                      .valid_in(MEM_wait ? 1'b0 : MEM_valid),
+                                      .valid_in((MEM_wait || lsu_misaligned || bus_fault) ? 1'b0 : MEM_valid),
                                       .alu_result_in(MEM_alu_out),
-                                      .data_mem_in(MEM_data_mem_out),
+                                      .data_mem_in(lsu_load_result),
                                       .pc_plus4_in(MEM_pc_plus4),
                                       .rd_addr_in(MEM_rd_addr),
                                       .reg_write_in(MEM_reg_write),
@@ -516,10 +523,85 @@ module cpu_top(
                                         .IF_pred_taken(IF_pred_taken),
                                         .IF_pred_target(IF_pred_target),
                                         .IF_pred_index(IF_pred_index));
+                                        
+
+    load_store_controller load_store_controller_ (.MEM_valid(MEM_valid),
+                                                 .MEM_mem_read(MEM_mem_read),
+                                                 .MEM_mem_write(MEM_mem_write),
+                                                 .funct3(MEM_funct3),
+                                                 .rs2_data(MEM_rs2_data),
+                                                 .alu_addr_in(MEM_alu_out),
+                                                 .raw_read_data(bus_load_data),
+                                                 .request(lsu_request),
+                                                 .write(lsu_write),
+                                                 .address(lsu_address),
+                                                 .write_data(lsu_write_data),
+                                                 .byte_sel(lsu_byte_sel),
+                                                 .load_result(lsu_load_result),
+                                                 .misaligned(lsu_misaligned));
+
+    cpu_bus_master cpu_bus_master_ (.request(lsu_request),
+                                    .write(lsu_write),
+                                    .address(lsu_address),
+                                    .write_data(lsu_write_data),
+                                    .byte_sel(lsu_byte_sel),
+                                    .ack(master_ack),
+                                    .err(master_err),
+                                    .read_data(master_read_data),
+                                    .MEM_wait(MEM_wait),
+                                    .load_data(bus_load_data),
+                                    .fault(bus_fault),
+                                    .bus_request(master_request),
+                                    .bus_write(master_write),
+                                    .bus_address(master_address),
+                                    .bus_write_data(master_write_data),
+                                    .bus_byte_sel(master_byte_sel));
+
+    bus_interconnect bus_interconnect_ (.master_request(master_request),
+                                        .master_write(master_write),
+                                        .master_address(master_address),
+                                        .master_write_data(master_write_data),
+                                        .master_byte_sel(master_byte_sel),
+                                        .master_ack(master_ack),
+                                        .master_err(master_err),
+                                        .master_read_data(master_read_data),
+                                        .ram_request(ram_request),
+                                        .ram_write(ram_write),
+                                        .ram_address(ram_address),
+                                        .ram_write_data(ram_write_data),
+                                        .ram_byte_sel(ram_byte_sel),
+                                        .ram_ack(ram_ack),
+                                        .ram_err(ram_err),
+                                        .ram_read_data(ram_read_data),
+                                        .uart_request(uart_request),
+                                        .uart_write(uart_write),
+                                        .uart_address(uart_address),
+                                        .uart_write_data(uart_write_data),
+                                        .uart_byte_sel(uart_byte_sel),
+                                        .uart_ack(uart_ack),
+                                        .uart_err(uart_err),
+                                        .uart_read_data(uart_read_data));
+
+    ram_wrapper ram_wrapper_ (.clk(clk),
+                              .rst(rst),
+                              .request(ram_request),
+                              .write(ram_write),
+                              .address(ram_address),
+                              .write_data(ram_write_data),
+                              .byte_sel(ram_byte_sel),
+                              .ack(ram_ack),
+                              .err(ram_err),
+                              .read_data(ram_read_data));
+
+    //temporary UART termination 
+    assign uart_ack = 1'b0;
+    assign uart_err = uart_request;
+    assign uart_read_data = 32'b0;
+
 
     assign debug_led[0] = ^IF_pc;
     assign debug_led[1] = ^ID_instr;
     assign debug_led[2] = ^WB_data;
-    assign debug_led[3] = ^MEM_data_mem_out;
+    assign debug_led[3] = ^lsu_load_result;
 
 endmodule
