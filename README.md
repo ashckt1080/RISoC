@@ -2,6 +2,8 @@
 
 A 32-bit **RV32IM** processor implemented in Verilog with a classic **5-stage in-order pipeline**.
 
+(OUT DATED DESCRIPTION - WORK IN PROGRESS)
+
 This project was built primarily to **learn** RISC-V processor architecture by implementing the datapath, control logic, hazards, forwarding, multi-cycle execution, dynamic branch prediction and FPGA integration stage by stage.
 
 The processor has been simulated with directed and **application-level test programs** and successfully synthesized for a **Xilinx Artix-7** FPGA at **100 MHz**.
