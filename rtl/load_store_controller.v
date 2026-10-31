@@ -1,133 +1,150 @@
 `timescale 1ns / 1ps
 
-module load_store_controller(
+module load_store_unit (
+    input clk,
+    input rst,
+
     input MEM_valid,
     input MEM_mem_read,
     input MEM_mem_write,
-    input [2:0] funct3,
-    input [31:0] rs2_data,
-    input [31:0] alu_addr_in,
+    input [2:0] MEM_funct3,
+    input [31:0] MEM_alu_addr,
+    input [31:0] MEM_rs2_data,
+    input MEM_advance,
 
-    input [31:0] raw_read_data,
-    
-    output request,
-    output write,
-    output [31:0] address,
-    output reg [31:0] write_data,
-    output reg [3:0] byte_sel,
-    output reg [31:0] load_result,
-    output reg misaligned
-    );
-    
-    wire memory_access = (MEM_mem_read || MEM_mem_write);
-    
-    assign write = MEM_mem_write;
-    assign address = alu_addr_in;
+    output req_valid,
+    input req_ready,
+    output req_write,
+    output [31:0] req_addr,
+    output [31:0] req_wdata,
+    output reg [3:0] req_wstrb,
 
-    wire [1:0] byte_index;
-    wire half_word_index;
+    input resp_valid,
+    output resp_ready,
+    input [31:0] resp_rdata,
+    input [1:0] resp_status,
 
-    assign byte_index = alu_addr_in[1:0];
-    assign half_word_index = alu_addr_in[1];
+    output mem_stall,
+    output mem_done,
+    output reg [31:0] mem_load_result,
+    output reg mem_misaligned,
+    output reg mem_access_fault
+);
 
-    localparam [2:0] LB = 3'b000;
-    localparam [2:0] LH = 3'b001;
-    localparam [2:0] LW = 3'b010;
-    localparam [2:0] LBU = 3'b100;
-    localparam [2:0] LHU = 3'b101;
+    localparam [1:0] IDLE = 2'd0;
+    localparam [1:0] WAIT_ACCEPT = 2'd1;
+    localparam [1:0] WAIT_RESPONSE = 2'd2;
+    localparam [1:0] COMPLETE = 2'd3;
 
-    localparam [2:0] SB = 3'b000;
-    localparam [2:0] SH = 3'b001;
-    localparam [2:0] SW = 3'b010;
+    reg [1:0] state;
 
-    always@(*) begin
-        write_data = 32'b0;
-        byte_sel = 4'b0000;
-        load_result = 32'b0;
-        misaligned = 1'b0;
+    wire mem_op = MEM_valid && (MEM_mem_read || MEM_mem_write);
+    wire valid_load = (MEM_funct3 == 3'b000) || (MEM_funct3 == 3'b001) ||
+                      (MEM_funct3 == 3'b010) || (MEM_funct3 == 3'b100) ||
+                      (MEM_funct3 == 3'b101);
+    wire valid_store = (MEM_funct3 == 3'b000) || (MEM_funct3 == 3'b001) ||
+                       (MEM_funct3 == 3'b010);
+    wire invalid_op = (MEM_mem_read && MEM_mem_write) ||
+                      (MEM_mem_read && !valid_load) ||
+                      (MEM_mem_write && !valid_store);
 
-        if(MEM_mem_write) begin
-            case(funct3)
+    wire half_access = (MEM_funct3 == 3'b001) ||
+                       (MEM_mem_read && MEM_funct3 == 3'b101);
+    wire word_access = (MEM_funct3 == 3'b010);
+    wire bad_alignment = (half_access && MEM_alu_addr[0]) ||
+                         (word_access && (MEM_alu_addr[1:0] != 2'b00));
 
-                SB: begin
-                    case(byte_index)
-                        2'b00: begin byte_sel = 4'b0001; write_data = {24'b0, rs2_data[7:0]}; end
-                        2'b01: begin byte_sel = 4'b0010; write_data = {16'b0, rs2_data[7:0], 8'b0}; end
-                        2'b10: begin byte_sel = 4'b0100; write_data = {8'b0, rs2_data[7:0], 16'b0}; end
-                        2'b11: begin byte_sel = 4'b1000; write_data = {rs2_data[7:0], 24'b0}; end
-                    endcase
-                end
+    wire [4:0] shift_bits = {MEM_alu_addr[1:0], 3'b000};
+    assign req_addr = {MEM_alu_addr[31:2], 2'b00};
+    assign req_write = MEM_mem_write;
+    assign req_wdata = MEM_rs2_data << shift_bits;
 
-                SH: begin
-                    if(alu_addr_in[0] != 1'b0) misaligned = 1'b1;
-                    else begin
-                        case(half_word_index)
-                            1'b0: begin byte_sel = 4'b0011; write_data = {16'b0, rs2_data[15:0]}; end
-                            1'b1: begin byte_sel = 4'b1100; write_data = {rs2_data[15:0], 16'b0}; end
-                        endcase
-                    end
-                end
-
-                SW: begin
-                    if(alu_addr_in[1:0] != 2'b00) misaligned = 1'b1;
-                    else begin byte_sel = 4'b1111; write_data = rs2_data; end
-                end
-
-                default: begin byte_sel = 4'b0000; write_data = 32'b0; end
-            endcase
-        end
-
-        else if(MEM_mem_read) begin
-            case(funct3)
-
-                LB: begin
-                    case(byte_index)
-                        2'b00: load_result = {{24{raw_read_data[7]}}, raw_read_data[7:0]};
-                        2'b01: load_result = {{24{raw_read_data[15]}}, raw_read_data[15:8]};
-                        2'b10: load_result = {{24{raw_read_data[23]}}, raw_read_data[23:16]};
-                        2'b11: load_result = {{24{raw_read_data[31]}}, raw_read_data[31:24]};
-                    endcase
-                end
-
-                LBU: begin
-                    case(byte_index)
-                        2'b00: load_result = {24'b0, raw_read_data[7:0]};
-                        2'b01: load_result = {24'b0, raw_read_data[15:8]};
-                        2'b10: load_result = {24'b0, raw_read_data[23:16]};
-                        2'b11: load_result = {24'b0, raw_read_data[31:24]};
-                    endcase
-                end
-
-                LH: begin
-                    if(alu_addr_in[0] != 1'b0) misaligned = 1'b1;
-                    else begin
-                        case(half_word_index)
-                            1'b0: load_result = {{16{raw_read_data[15]}}, raw_read_data[15:0]};
-                            1'b1: load_result = {{16{raw_read_data[31]}}, raw_read_data[31:16]};
-                        endcase
-                    end
-                end
-
-                LHU: begin
-                    if(alu_addr_in[0] != 1'b0) misaligned = 1'b1;
-                    else begin
-                        case(half_word_index)
-                            1'b0: load_result = {16'b0, raw_read_data[15:0]};
-                            1'b1: load_result = {16'b0, raw_read_data[31:16]};
-                        endcase
-                    end
-                end
-
-                LW: begin
-                    if(alu_addr_in[1:0] != 2'b00) misaligned = 1'b1;
-                    else load_result = raw_read_data;
-                end
-
-                default: load_result = 32'b0;
+    always @(*) begin
+        req_wstrb = 4'b0000;
+        if (MEM_mem_write) begin
+            case (MEM_funct3)
+                3'b000: req_wstrb = 4'b0001 << MEM_alu_addr[1:0];
+                3'b001: req_wstrb = 4'b0011 << MEM_alu_addr[1:0];
+                3'b010: req_wstrb = 4'b1111;
+                default: req_wstrb = 4'b0000;
             endcase
         end
     end
 
-    assign request = MEM_valid && memory_access && !misaligned;
+    wire [31:0] shifted_read = resp_rdata >> shift_bits;
+    reg [31:0] formatted_read;
 
+    always @(*) begin
+        case (MEM_funct3)
+            3'b000: formatted_read = {{24{shifted_read[7]}}, shifted_read[7:0]};
+            3'b001: formatted_read = {{16{shifted_read[15]}}, shifted_read[15:0]};
+            3'b010: formatted_read = resp_rdata;
+            3'b100: formatted_read = {24'b0, shifted_read[7:0]};
+            3'b101: formatted_read = {16'b0, shifted_read[15:0]};
+            default: formatted_read = 32'b0;
+        endcase
+    end
+
+    assign req_valid = (state == WAIT_ACCEPT);
+    assign resp_ready = (state == WAIT_RESPONSE);
+    assign mem_done = (state == COMPLETE);
+    assign mem_stall = (state == WAIT_ACCEPT) ||
+                        (state == WAIT_RESPONSE) ||
+                        ((state == IDLE) && mem_op);
+
+    always @(posedge clk) begin
+        if (rst) begin
+            state <= IDLE;
+            mem_load_result <= 32'b0;
+            mem_misaligned <= 1'b0;
+            mem_access_fault <= 1'b0;
+        end else begin
+            case (state)
+                IDLE: begin
+                    if (mem_op) begin
+                        mem_load_result <= 32'b0;
+                        mem_misaligned <= 1'b0;
+                        mem_access_fault <= 1'b0;
+
+                        if (invalid_op) begin
+
+                            mem_access_fault <= 1'b1;
+                            state <= COMPLETE;
+                        end else if (bad_alignment) begin
+                            mem_misaligned <= 1'b1;
+                            state <= COMPLETE;
+                        end else begin
+                            state <= WAIT_ACCEPT;
+                        end
+                    end
+                end
+
+                WAIT_ACCEPT: begin
+                    if (req_ready)
+                        state <= WAIT_RESPONSE;
+                end
+
+                WAIT_RESPONSE: begin
+                    if (resp_valid) begin
+                        if (resp_status != 2'b00)
+                            mem_access_fault <= 1'b1;
+                        else if (MEM_mem_read)
+                            mem_load_result <= formatted_read;
+                        state <= COMPLETE;
+                    end
+                end
+
+                COMPLETE: begin
+                    if (MEM_advance) begin
+
+                        state <= IDLE;
+                        mem_misaligned <= 1'b0;
+                        mem_access_fault <= 1'b0;
+                    end
+                end
+
+                default: state <= IDLE;
+            endcase
+        end
+    end
 endmodule
