@@ -5,7 +5,6 @@ module cpu_top(
     input raw_rst,
     output [3:0] debug_led
     );
-
     wire rst;
 
     reset_sync reset_sync_ (.clk(clk),
@@ -24,16 +23,14 @@ module cpu_top(
 
     assign IF_fetch_valid = (IF_pc[1:0] == 2'b00) && (IF_pc[31:12] == 20'b0);
 
-    //Branch Predictor / BTB signals
+    //Branch Predictor signals
     wire [5:0] IF_pred_index;
     wire [5:0] ID_pred_index;
     wire [5:0] EX_pred_index;
-
     wire IF_pred_taken;
     wire [31:0] IF_pred_target;
     wire IF_pred_target_aligned;
     wire IF_pred_redirect;
-
     wire IF_spec_taken;
     wire ID_spec_taken;
     wire EX_spec_taken;
@@ -102,9 +99,7 @@ module cpu_top(
     wire EX_z;
     wire EX_MEM_enable;
     wire EX_valid;
-
     wire [31:0] EX_alu_m_result;
-
     wire EX_branch_target_aligned;
     wire EX_branch_mispredict;
     wire [31:0] EX_branch_recovery;
@@ -114,7 +109,6 @@ module cpu_top(
     assign EX_branch_target_aligned = (EX_branch_target[1:0] == 2'b00);
     assign EX_branch_mispredict = EX_valid && EX_branch && (EX_spec_taken != EX_branch_taken);
     assign EX_branch_recovery = EX_branch_taken ? EX_branch_target : EX_pc_plus4;
-    assign EX_branch_recovery_redirect = EX_branch_mispredict && (!EX_branch_taken || EX_branch_target_aligned);
 
     //M unit
     wire EX_is_m_instr;
@@ -124,10 +118,6 @@ module cpu_top(
     wire EX_m_stall;
     wire EX_m_done;
     wire [31:0] EX_m_out;
-
-    assign EX_is_m_instr = (EX_valid && EX_opcode == 7'b0110011 && EX_funct7 == 7'b0000001);
-    assign EX_m_start = EX_is_m_instr && !EX_m_started && !EX_m_busy;
-    assign EX_m_stall = EX_is_m_instr && !EX_m_done;
 
     //MEM signals
     wire [31:0] MEM_pc_plus4;
@@ -140,10 +130,19 @@ module cpu_top(
     wire MEM_mem_write;
     wire MEM_mem_read;
     wire [1:0] MEM_wb_src;
-
     wire MEM_valid;
     wire [31:0] MEM_data_mem_out;
-
+    wire MEM_stall;
+    wire MEM_done;
+    wire MEM_advance;
+    wire MEM_misaligned;
+    wire MEM_access_fault;
+    
+    assign EX_branch_recovery_redirect = !MEM_stall && EX_branch_mispredict && (!EX_branch_taken || EX_branch_target_aligned);
+    assign EX_is_m_instr = (EX_valid && EX_opcode == 7'b0110011 && EX_funct7 == 7'b0000001);
+    assign EX_m_start = EX_is_m_instr && !EX_m_started && !EX_m_busy && !MEM_stall;
+    assign EX_m_stall = EX_is_m_instr && !EX_m_done;
+    
     //WB signals
     wire [31:0] WB_data;
     wire WB_reg_write;
@@ -153,6 +152,8 @@ module cpu_top(
     wire [31:0] WB_alu_out;
     wire [31:0] WB_pc_plus4;
     wire [1:0] WB_wb_src;
+    wire [31:0] WB_mem_data;
+    reg WB_write_consumed;
 
     //Hazard signals
     wire EX_forward_a_mem;
@@ -161,32 +162,39 @@ module cpu_top(
     wire EX_forward_b_wb;
     wire [31:0] EX_forwarded_rs1_data;
     wire [31:0] EX_forwarded_rs2_data;
-
     wire ID_stall;
     wire EX_flush;
-
     wire EX_jump_redirect;
     wire EX_instr_addr_fault;
 
     assign EX_jump_target_aligned = (EX_jump_target[1:0] == 2'b00);
-    assign EX_jump_redirect = EX_valid && EX_jump_taken && EX_jump_target_aligned;
+    assign EX_jump_redirect = !MEM_stall && EX_valid && EX_jump_taken && EX_jump_target_aligned;
 
-    assign EX_instr_addr_fault = EX_valid && ((EX_branch_taken && !EX_branch_target_aligned) || (EX_jump_taken && !EX_jump_target_aligned));
+    assign EX_instr_addr_fault = !MEM_stall && EX_valid && ((EX_branch_taken && !EX_branch_target_aligned) || (EX_jump_taken && !EX_jump_target_aligned));
 
     assign IF_pc_plus4 = IF_pc + 32'd4;
 
-    assign IF_pc_hold = !EX_flush && (ID_stall || EX_m_stall);
-    assign IF_pc_next = IF_pc_hold ? IF_pc : IF_pc_mux_out;
+    assign IF_pc_hold  = !EX_flush && (ID_stall || EX_m_stall || MEM_stall);
+    assign IF_pc_next  = IF_pc_hold ? IF_pc : IF_pc_mux_out;
 
-    assign IF_ID_flush = EX_flush | EX_instr_addr_fault;
-    assign IF_ID_enable = (ID_stall | EX_m_stall) ? 1'b0 : 1'b1;
+    assign IF_ID_flush  = EX_flush | EX_instr_addr_fault;
+    assign IF_ID_enable = !(ID_stall || EX_m_stall || MEM_stall);
 
-    assign ID_EX_flush = EX_flush | EX_instr_addr_fault;
-    assign ID_EX_enable = EX_m_stall ? 1'b0 : 1'b1;
+    assign ID_EX_flush  = EX_flush | EX_instr_addr_fault;
+    assign ID_EX_enable = !(EX_m_stall || MEM_stall);
 
-    assign EX_MEM_enable = 1'b1;
+    assign EX_MEM_enable = !MEM_stall;
+    assign MEM_WB_enable = !MEM_stall;
+    assign MEM_advance = MEM_WB_enable;
 
-    assign MEM_WB_enable = 1'b1;
+    always @(posedge clk) begin
+        if (rst)
+            WB_write_consumed <= 1'b0;
+        else if (MEM_WB_enable)
+            WB_write_consumed <= 1'b0;
+        else if (WB_valid && WB_reg_write)
+            WB_write_consumed <= 1'b1;
+    end
 
     always @(posedge clk) begin
         if(rst) begin
@@ -268,7 +276,7 @@ module cpu_top(
 
     reg_file reg_file_ (.clk(clk),
                         .rst(rst),
-                        .write_en(WB_reg_write),
+                        .write_en(WB_reg_write && !WB_write_consumed),
                         .rs1_addr(ID_rs1_addr),
                         .rs2_addr(ID_rs2_addr),
                         .rd_addr(WB_rd_addr),
@@ -391,16 +399,16 @@ module cpu_top(
     mem_wb_register mem_wb_register_ (.clk(clk),
                                       .rst(rst),
                                       .mem_wb_enable(MEM_WB_enable),
-                                      .valid_in(MEM_valid),
+                                      .valid_in(MEM_valid && !(MEM_done && (MEM_mem_read || MEM_mem_write) && (MEM_misaligned || MEM_access_fault))),
                                       .alu_result_in(MEM_alu_out),
-                                      .data_mem_in(32'b0),
+                                      .data_mem_in(MEM_data_mem_out),
                                       .pc_plus4_in(MEM_pc_plus4),
                                       .rd_addr_in(MEM_rd_addr),
                                       .reg_write_in(MEM_reg_write),
                                       .wb_src_in(MEM_wb_src),
                                       .valid_out(WB_valid),
                                       .alu_result_out(WB_alu_out),
-                                      .data_mem_out(),
+                                      .data_mem_out(WB_mem_data),
                                       .pc_plus4_out(WB_pc_plus4),
                                       .rd_addr_out(WB_rd_addr),
                                       .reg_write_out(WB_reg_write),
@@ -408,7 +416,7 @@ module cpu_top(
 
     wb_mux wb_mux_ (.alu_result(WB_alu_out),
                     .pc_plus4(WB_pc_plus4),
-                    .data_mem_out(MEM_data_mem_out),
+                    .data_mem_out(WB_mem_data),
                     .wb_src(WB_wb_src),
                     .wb_data(WB_data));
 
@@ -449,8 +457,8 @@ module cpu_top(
                                         .ID_rs2_used(ID_rs2_used),
                                         .stall(ID_stall));
 
-    flush_controller flush_controller_ (.branch_mispredict(EX_branch_mispredict),
-                                        .jump_taken(EX_valid && EX_jump_taken),
+    flush_controller flush_controller_ (.branch_mispredict(EX_branch_mispredict && !MEM_stall),
+                                        .jump_taken(EX_valid && EX_jump_taken && !MEM_stall),
                                         .flush(EX_flush));
 
     m_unit m_unit_ (.clk(clk),
@@ -474,7 +482,7 @@ module cpu_top(
                                         .EX_pc(EX_pc),
                                         .EX_branch_target(EX_branch_target),
                                         .EX_pred_index(EX_pred_index),
-                                        .EX_valid(EX_valid),
+                                        .EX_valid(EX_valid && !MEM_stall),
                                         .EX_branch(EX_branch),
                                         .EX_branch_taken(EX_branch_taken),
                                         .IF_pred_taken(IF_pred_taken),
@@ -482,15 +490,176 @@ module cpu_top(
                                         .IF_pred_index(IF_pred_index));
                                         
 
-    data_mem data_mem_ (.clk(clk),
-                        .mem_read(MEM_mem_read),
-                        .mem_write(MEM_mem_write),
-                        .alu_addr_in(MEM_alu_out),
-                        .data_in(MEM_rs2_data),
-                        .funct3(MEM_funct3),
-                        .valid(MEM_valid),
-                        .data_out(MEM_data_mem_out));
+    wire lsu_req_valid, lsu_req_ready, lsu_req_write;
+    wire [31:0] lsu_req_addr, lsu_req_wdata;
+    wire [3:0] lsu_req_wstrb;
+    wire lsu_resp_valid, lsu_resp_ready;
+    wire [31:0] lsu_resp_rdata;
+    wire [1:0] lsu_resp_status;
 
+    wire [31:0] axi_m_awaddr;
+    wire [2:0] axi_m_awprot;
+    wire axi_m_awvalid;
+    wire axi_m_awready;
+    wire [31:0] axi_m_wdata;
+    wire [3:0] axi_m_wstrb;
+    wire axi_m_wvalid;
+    wire axi_m_wready;
+    wire [1:0] axi_m_bresp;
+    wire axi_m_bvalid;
+    wire axi_m_bready;
+    wire [31:0] axi_m_araddr;
+    wire [2:0] axi_m_arprot;
+    wire axi_m_arvalid;
+    wire axi_m_arready;
+    wire [31:0] axi_m_rdata;
+    wire [1:0] axi_m_rresp;
+    wire axi_m_rvalid;
+    wire axi_m_rready;
+
+    wire [31:0] axi_ram_awaddr;
+    wire [2:0] axi_ram_awprot;
+    wire axi_ram_awvalid;
+    wire axi_ram_awready;
+    wire [31:0] axi_ram_wdata;
+    wire [3:0] axi_ram_wstrb;
+    wire axi_ram_wvalid;
+    wire axi_ram_wready;
+    wire [1:0] axi_ram_bresp;
+    wire axi_ram_bvalid;
+    wire axi_ram_bready;
+    wire [31:0] axi_ram_araddr;
+    wire [2:0] axi_ram_arprot;
+    wire axi_ram_arvalid;
+    wire axi_ram_arready;
+    wire [31:0] axi_ram_rdata;
+    wire [1:0] axi_ram_rresp;
+    wire axi_ram_rvalid;
+    wire axi_ram_rready;
+
+    load_store_unit load_store_unit_ (
+        .clk(clk),
+        .rst(rst),
+        .MEM_valid(MEM_valid),
+        .MEM_mem_read(MEM_mem_read),
+        .MEM_mem_write(MEM_mem_write),
+        .MEM_funct3(MEM_funct3),
+        .MEM_alu_addr(MEM_alu_out),
+        .MEM_rs2_data(MEM_rs2_data),
+        .MEM_advance(MEM_advance),
+        .req_valid(lsu_req_valid),
+        .req_ready(lsu_req_ready),
+        .req_write(lsu_req_write),
+        .req_addr(lsu_req_addr),
+        .req_wdata(lsu_req_wdata),
+        .req_wstrb(lsu_req_wstrb),
+        .resp_valid(lsu_resp_valid),
+        .resp_ready(lsu_resp_ready),
+        .resp_rdata(lsu_resp_rdata),
+        .resp_status(lsu_resp_status),
+        .mem_stall(MEM_stall),
+        .mem_done(MEM_done),
+        .mem_load_result(MEM_data_mem_out),
+        .mem_misaligned(MEM_misaligned),
+        .mem_access_fault(MEM_access_fault));
+
+    axi4_lite_master axi4_lite_master_ (
+        .clk(clk),
+        .rst(rst),
+        .req_valid(lsu_req_valid),
+        .req_ready(lsu_req_ready),
+        .req_write(lsu_req_write),
+        .req_addr(lsu_req_addr),
+        .req_wdata(lsu_req_wdata),
+        .req_wstrb(lsu_req_wstrb),
+        .resp_valid(lsu_resp_valid),
+        .resp_ready(lsu_resp_ready),
+        .resp_rdata(lsu_resp_rdata),
+        .resp_status(lsu_resp_status),
+        .m_axi_awaddr(axi_m_awaddr),
+        .m_axi_awprot(axi_m_awprot),
+        .m_axi_awvalid(axi_m_awvalid),
+        .m_axi_awready(axi_m_awready),
+        .m_axi_wdata(axi_m_wdata),
+        .m_axi_wstrb(axi_m_wstrb),
+        .m_axi_wvalid(axi_m_wvalid),
+        .m_axi_wready(axi_m_wready),
+        .m_axi_bresp(axi_m_bresp),
+        .m_axi_bvalid(axi_m_bvalid),
+        .m_axi_bready(axi_m_bready),
+        .m_axi_araddr(axi_m_araddr),
+        .m_axi_arprot(axi_m_arprot),
+        .m_axi_arvalid(axi_m_arvalid),
+        .m_axi_arready(axi_m_arready),
+        .m_axi_rdata(axi_m_rdata),
+        .m_axi_rresp(axi_m_rresp),
+        .m_axi_rvalid(axi_m_rvalid),
+        .m_axi_rready(axi_m_rready));
+
+    axi4_lite_interconnect axi4_lite_interconnect_ (
+        .clk(clk),
+        .rst(rst),
+        .s_axi_awaddr(axi_m_awaddr),
+        .m0_axi_awaddr(axi_ram_awaddr),
+        .s_axi_awprot(axi_m_awprot),
+        .m0_axi_awprot(axi_ram_awprot),
+        .s_axi_awvalid(axi_m_awvalid),
+        .m0_axi_awvalid(axi_ram_awvalid),
+        .s_axi_awready(axi_m_awready),
+        .m0_axi_awready(axi_ram_awready),
+        .s_axi_wdata(axi_m_wdata),
+        .m0_axi_wdata(axi_ram_wdata),
+        .s_axi_wstrb(axi_m_wstrb),
+        .m0_axi_wstrb(axi_ram_wstrb),
+        .s_axi_wvalid(axi_m_wvalid),
+        .m0_axi_wvalid(axi_ram_wvalid),
+        .s_axi_wready(axi_m_wready),
+        .m0_axi_wready(axi_ram_wready),
+        .s_axi_bresp(axi_m_bresp),
+        .m0_axi_bresp(axi_ram_bresp),
+        .s_axi_bvalid(axi_m_bvalid),
+        .m0_axi_bvalid(axi_ram_bvalid),
+        .s_axi_bready(axi_m_bready),
+        .m0_axi_bready(axi_ram_bready),
+        .s_axi_araddr(axi_m_araddr),
+        .m0_axi_araddr(axi_ram_araddr),
+        .s_axi_arprot(axi_m_arprot),
+        .m0_axi_arprot(axi_ram_arprot),
+        .s_axi_arvalid(axi_m_arvalid),
+        .m0_axi_arvalid(axi_ram_arvalid),
+        .s_axi_arready(axi_m_arready),
+        .m0_axi_arready(axi_ram_arready),
+        .s_axi_rdata(axi_m_rdata),
+        .m0_axi_rdata(axi_ram_rdata),
+        .s_axi_rresp(axi_m_rresp),
+        .m0_axi_rresp(axi_ram_rresp),
+        .s_axi_rvalid(axi_m_rvalid),
+        .m0_axi_rvalid(axi_ram_rvalid),
+        .s_axi_rready(axi_m_rready),
+        .m0_axi_rready(axi_ram_rready));
+
+    axi4_lite_bram_slave axi4_lite_bram_slave_ (
+        .clk (clk),
+        .rst (rst),
+        .s_axi_awaddr (axi_ram_awaddr),
+        .s_axi_awprot (axi_ram_awprot),
+        .s_axi_awvalid (axi_ram_awvalid),
+        .s_axi_awready (axi_ram_awready),
+        .s_axi_wdata (axi_ram_wdata),
+        .s_axi_wstrb (axi_ram_wstrb),
+        .s_axi_wvalid (axi_ram_wvalid),
+        .s_axi_wready (axi_ram_wready),
+        .s_axi_bresp (axi_ram_bresp),
+        .s_axi_bvalid (axi_ram_bvalid),
+        .s_axi_bready (axi_ram_bready),
+        .s_axi_araddr (axi_ram_araddr),
+        .s_axi_arprot (axi_ram_arprot),
+        .s_axi_arvalid (axi_ram_arvalid),
+        .s_axi_arready (axi_ram_arready),
+        .s_axi_rdata (axi_ram_rdata),
+        .s_axi_rresp (axi_ram_rresp),
+        .s_axi_rvalid (axi_ram_rvalid),
+        .s_axi_rready (axi_ram_rready));
 
     assign debug_led[0] = ^IF_pc;
     assign debug_led[1] = ^ID_instr;
